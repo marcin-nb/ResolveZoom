@@ -339,7 +339,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let titleItem = NSMenuItem()
         let titleStr = NSMutableAttributedString(string: "ResolveZoom\n",
                                                  attributes: [.font: NSFont.boldSystemFont(ofSize: 13)])
-        titleStr.append(NSAttributedString(string: "Version: 0.1  ·  © Marcin Kuśnierz",
+        titleStr.append(NSAttributedString(string: "Version: 0.2  ·  © Marcin Kuśnierz",
                                            attributes: [
                                                .font: NSFont.systemFont(ofSize: 10),
                                                .foregroundColor: NSColor.secondaryLabelColor
