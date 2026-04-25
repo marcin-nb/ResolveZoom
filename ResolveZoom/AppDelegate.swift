@@ -1,4 +1,80 @@
 import Cocoa
+import SwiftUI
+
+struct PreferencesView: View {
+    @State private var multiplier: Double
+    @State private var invertZoom: Bool
+    @State private var launchAtLogin: Bool
+
+    let onSave: (Double, Bool, Bool) -> Void
+    let onCancel: () -> Void
+
+    private let defaultMultiplier = 800.0
+
+    init(multiplier: Double, invertZoom: Bool, launchAtLogin: Bool,
+         onSave: @escaping (Double, Bool, Bool) -> Void,
+         onCancel: @escaping () -> Void) {
+        _multiplier = State(initialValue: multiplier)
+        _invertZoom = State(initialValue: invertZoom)
+        _launchAtLogin = State(initialValue: launchAtLogin)
+        self.onSave = onSave
+        self.onCancel = onCancel
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Sekcja slidera poza Form — daje pełną szerokość
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Zoom Sensitivity")
+                    .font(.headline)
+                    .padding(.leading, 4)
+
+                VStack(alignment: .trailing, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Slider(value: $multiplier, in: 100...1500)
+                        Text("\(Int(multiplier))")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                            .frame(width: 36, alignment: .trailing)
+                    }
+                    Button("Reset to Default") { multiplier = defaultMultiplier }
+                        .controlSize(.small)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity)
+                .background(RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(NSColor.controlBackgroundColor)))
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .padding(.bottom, 4)
+
+            // Pstryczki w Form — tu grouped style działa idealnie
+            Form {
+                Section {
+                    Toggle("Invert zoom direction", isOn: $invertZoom)
+                    Toggle("Launch at Login", isOn: $launchAtLogin)
+                }
+            }
+            .formStyle(.grouped)
+            .frame(height: 130)
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { onCancel() }
+                    .keyboardShortcut(.escape, modifiers: [])
+                Button("OK") { onSave(multiplier, invertZoom, launchAtLogin) }
+                    .keyboardShortcut(.return, modifiers: [])
+                    .buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 360, height: 310)
+    }
+}
 
 class AppDelegate: NSObject, NSApplicationDelegate {
 
@@ -216,9 +292,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let direction: Double = delegate.invertZoom ? 1.0 : -1.0
             let delta = mag * direction * delegate.multiplier
 
-            let mousePos = NSEvent.mouseLocation
-            let screenHeight = NSScreen.main?.frame.height ?? 900
-            let cgPoint = CGPoint(x: mousePos.x, y: screenHeight - mousePos.y)
+            // Bierzemy pozycję kursora wprost z eventu magnify — już jest w układzie CGEvent,
+            // działa poprawnie na wszystkich monitorach bez ręcznej konwersji współrzędnych
+            let cgPoint = event.location
 
             guard let scrollEvent = CGEvent(
                 scrollWheelEvent2Source: nil, units: .pixel,
@@ -285,12 +361,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let autoItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleAutolaunch(_:)), keyEquivalent: "")
-        autoItem.state = isAutolaunchEnabled() ? .on : .off
-        menu.addItem(autoItem)
-
-        menu.addItem(.separator())
-
         menu.addItem(NSMenuItem(title: "Quit ResolveZoom", action: #selector(quit), keyEquivalent: "q"))
 
         statusItem.menu = menu
@@ -308,43 +378,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 160),
-            styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
+        let view = PreferencesView(
+            multiplier: multiplier,
+            invertZoom: invertZoom,
+            launchAtLogin: isAutolaunchEnabled(),
+            onSave: { [weak self] mult, invert, login in
+                guard let self = self else { return }
+                self.multiplier = mult
+                self.invertZoom = invert
+                self.setAutolaunch(login)
+                self.preferencesWindow?.close()
+            },
+            onCancel: { [weak self] in
+                self?.preferencesWindow?.close()
+            }
         )
+
+        let controller = NSHostingController(rootView: view)
+        let w = NSWindow(contentViewController: controller)
         w.title = "Preferences"
+        w.styleMask = [.titled, .closable]
         w.isReleasedWhenClosed = false
         w.center()
-
-        let cv = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 160))
-
-        let sensLabel = NSTextField(labelWithString: "Zoom Sensitivity")
-        sensLabel.frame = NSRect(x: 20, y: 128, width: 200, height: 18)
-        sensLabel.font = NSFont.systemFont(ofSize: 12)
-        cv.addSubview(sensLabel)
-
-        let resetBtn = NSButton(title: "Reset to Default", target: self, action: #selector(resetToDefault(_:)))
-        resetBtn.frame = NSRect(x: 210, y: 124, width: 110, height: 22)
-        resetBtn.bezelStyle = .rounded
-        resetBtn.controlSize = .small
-        cv.addSubview(resetBtn)
-
-        let slider = NSSlider(value: multiplier, minValue: sliderMin, maxValue: sliderMax,
-                              target: self, action: #selector(sliderChanged(_:)))
-        slider.frame = NSRect(x: 20, y: 100, width: 300, height: 22)
-        slider.isContinuous = true
-        slider.tag = 1
-        cv.addSubview(slider)
-
-        let invertCheck = NSButton(checkboxWithTitle: "Invert zoom direction",
-                                   target: self, action: #selector(invertChanged(_:)))
-        invertCheck.frame = NSRect(x: 20, y: 65, width: 300, height: 20)
-        invertCheck.state = invertZoom ? .on : .off
-        cv.addSubview(invertCheck)
-
-        w.contentView = cv
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         preferencesWindow = w
@@ -376,12 +431,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
     @objc func sliderChanged(_ sender: NSSlider) {
         multiplier = sender.doubleValue
+        preferencesWindow?.contentView?.viewWithTag(2).flatMap { $0 as? NSTextField }?.stringValue = "\(Int(multiplier))"
     }
 
     @objc func resetToDefault(_ sender: Any) {
         multiplier = defaultMultiplier
-        // Update slider in the preferences window if open
         preferencesWindow?.contentView?.viewWithTag(1).flatMap { $0 as? NSSlider }?.doubleValue = defaultMultiplier
+        preferencesWindow?.contentView?.viewWithTag(2).flatMap { $0 as? NSTextField }?.stringValue = "\(Int(defaultMultiplier))"
     }
 
     @objc func invertChanged(_ sender: NSButton) {
