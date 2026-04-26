@@ -25,6 +25,8 @@ If ResolveZoom saves you time, consider buying me a coffee — it helps keep the
 - DaVinci Resolve (any recent version)
 - A Mac with a trackpad (built-in or Magic Trackpad)
 
+**Tested on:** macOS 15 Sequoia. Compatibility with macOS 26 Tahoe has not been verified yet.
+
 ---
 
 ## Installation

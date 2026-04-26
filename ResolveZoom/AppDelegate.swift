@@ -108,6 +108,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastMagnifySign: Double = 0
     var lastHorizontalScrollTime: Double = 0
 
+    // Consecutive event counter — filters out accidental taps/clicks
+    var consecutiveMagnifyCount: Int = 0
+    let magnifyCountThreshold: Int = 3
+    let magnifyTimeWindow: Double = 0.3
+
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
         setupMenuBar()
@@ -278,12 +283,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return Unmanaged.passRetained(event)
             }
 
-            // Filter scroll artifacts: real pinch gestures don't flip direction within 100ms
+            // Consecutive event counter: require sustained stream of events (real pinch)
+            // before triggering zoom — clicks generate only 1-2 events
             let now = CFAbsoluteTimeGetCurrent()
+            if now - delegate.lastMagnifyTime > delegate.magnifyTimeWindow {
+                delegate.consecutiveMagnifyCount = 0
+            }
+            delegate.consecutiveMagnifyCount += 1
+            delegate.lastMagnifyTime = now
+            guard delegate.consecutiveMagnifyCount >= delegate.magnifyCountThreshold else {
+                return Unmanaged.passRetained(event)
+            }
+
+            // Filter scroll artifacts: real pinch gestures don't flip direction within 100ms
             let currentSign = mag > 0 ? 1.0 : -1.0
             let isSignFlip = currentSign != delegate.lastMagnifySign && delegate.lastMagnifySign != 0
             let isQuickFlip = (now - delegate.lastMagnifyTime) < 0.1
-            delegate.lastMagnifyTime = now
             delegate.lastMagnifySign = currentSign
             if isSignFlip && isQuickFlip {
                 return Unmanaged.passRetained(event)
@@ -339,7 +354,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let titleItem = NSMenuItem()
         let titleStr = NSMutableAttributedString(string: "ResolveZoom\n",
                                                  attributes: [.font: NSFont.boldSystemFont(ofSize: 13)])
-        titleStr.append(NSAttributedString(string: "Version: 0.2  ·  © Marcin Kuśnierz",
+        titleStr.append(NSAttributedString(string: "Version: 0.3  ·  © Marcin Kuśnierz",
                                            attributes: [
                                                .font: NSFont.systemFont(ofSize: 10),
                                                .foregroundColor: NSColor.secondaryLabelColor
