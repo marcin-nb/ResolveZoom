@@ -14,6 +14,8 @@ DaVinci Resolve doesn't support pinch-to-zoom on the timeline out of the box. Re
 - **Multi-monitor support** — works correctly across all display configurations, including Resolve's dual-screen mode
 - **Launch at Login** — start automatically with macOS
 - **Minimal footprint** — lives in the menu bar, uses no resources when Resolve isn't in focus
+- **Built-in diagnostics** — the menu shows which app is detected, how many gestures were handled, and why the last one was skipped
+- **Manual Resolve selection** — point the app at your Resolve install if auto-detection doesn't find it
 
 If ResolveZoom saves you time, consider buying me a coffee — it helps keep the project going! [![Ko-fi](https://img.shields.io/badge/Buy%20me%20a%20coffee-ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/marcinkusnierz)
 
@@ -25,8 +27,7 @@ If ResolveZoom saves you time, consider buying me a coffee — it helps keep the
 - DaVinci Resolve (any recent version)
 - A Mac with a trackpad (built-in or Magic Trackpad)
 
-**Tested on:** macOS 15 Sequoia. Compatibility with macOS 26 Tahoe has not been verified yet.
-
+**Tested on:** macOS 26 Tahoe with DaVinci Resolve 21.0.4. Earlier versions were tested on macOS 15 Sequoia.
 ---
 
 ## Installation
