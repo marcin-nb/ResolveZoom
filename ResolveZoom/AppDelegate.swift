@@ -1,5 +1,6 @@
 import Cocoa
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct PreferencesView: View {
     @State private var multiplier: Double
@@ -76,7 +77,7 @@ struct PreferencesView: View {
     }
 }
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var statusItem: NSStatusItem!
     var tap: CFMachPort?
@@ -84,6 +85,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var permissionTimer: Timer?
 
     var statusMenuItem: NSMenuItem!
+    var diagnosticsMenuItem: NSMenuItem!
+    var selectResolveMenuItem: NSMenuItem!
+    var clearResolveMenuItem: NSMenuItem!
     var permissionsWindow: NSWindow?
     var preferencesWindow: NSWindow?
 
@@ -93,14 +97,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let sliderMin: Double = 100.0
     let sliderMax: Double = 1500.0
 
-    var multiplier: Double {
-        get { defaults.object(forKey: "multiplier") == nil ? defaultMultiplier : defaults.double(forKey: "multiplier") }
-        set { defaults.set(newValue, forKey: "multiplier") }
+    // Settings are held in memory and mirrored to UserDefaults on write.
+    // They used to be computed properties that read UserDefaults on every access —
+    // which meant a lookup per magnify event, i.e. 60–120 times a second during a
+    // pinch. Reading a stored property costs nothing; `didSet` keeps persistence
+    // identical, so every existing assignment site still works unchanged.
+    var multiplier: Double = 800.0 {
+        didSet { defaults.set(multiplier, forKey: "multiplier") }
     }
 
-    var invertZoom: Bool {
-        get { defaults.bool(forKey: "invertZoom") }
-        set { defaults.set(newValue, forKey: "invertZoom") }
+    var invertZoom: Bool = false {
+        didSet { defaults.set(invertZoom, forKey: "invertZoom") }
     }
 
     // Scroll-artifact detection
@@ -113,10 +120,108 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let magnifyCountThreshold: Int = 3
     let magnifyTimeWindow: Double = 0.3
 
+    /// Carries the sub-pixel remainder between events. `Int32(delta)` truncates
+    /// toward zero, so at low sensitivity settings a slow pinch produced deltas
+    /// below 1.0 that were silently discarded and the gesture appeared to stall.
+    var zoomAccumulator: Double = 0
+
+    /// Cached frontmost bundle id. Calling `NSWorkspace.shared.frontmostApplication`
+    /// inside the tap callback meant one lookup per event; it only changes when the
+    /// active app changes, which we already observe.
+    var cachedFrontmostBundleId: String?
+
+    // Diagnostics — surfaced in the menu so a user reporting "it doesn't work" can
+    // tell us what the app actually sees instead of us guessing.
+    var magnifyEventsSeen: Int = 0
+    var magnifyEventsActedOn: Int = 0
+    var lastMagnifyMagnitude: Double = 0
+    var lastSkipReason: String = "—"
+
+    /// Bundle id the user pinned manually by picking Resolve.app. Empty = auto-detect.
+    var resolveBundleIdOverride: String = "" {
+        didSet { defaults.set(resolveBundleIdOverride, forKey: "resolveBundleIdOverride") }
+    }
+
+    /// Matches DaVinci Resolve. If the user pinned a specific app, only that one counts.
+    /// Otherwise fall back to a prefix match: Blackmagic ships one bundle for both the
+    /// free and Studio editions, but betas and future builds may differ, and a prefix
+    /// costs nothing while failing less often. The prefix is narrow enough to exclude
+    /// the siblings installed alongside Resolve (`…DaVinciRemoteMonitor`,
+    /// `…UninstallDaVinciResolve`).
+    func isResolveApp(_ id: String?) -> Bool {
+        guard let id = id else { return false }
+        if !resolveBundleIdOverride.isEmpty {
+            return id.caseInsensitiveCompare(resolveBundleIdOverride) == .orderedSame
+        }
+        return id.lowercased().hasPrefix("com.blackmagic-design.davinciresolve")
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        loadSettings()
         setupMenuBar()
+        refreshFrontmostApp()
         checkAccessibilityAndStart()
+    }
+
+    /// Reads persisted settings once at launch. Uses the same UserDefaults keys as
+    /// before, so existing users keep their configuration.
+    func loadSettings() {
+        multiplier = defaults.object(forKey: "multiplier") == nil
+            ? defaultMultiplier
+            : defaults.double(forKey: "multiplier")
+        invertZoom = defaults.bool(forKey: "invertZoom")
+        resolveBundleIdOverride = defaults.string(forKey: "resolveBundleIdOverride") ?? ""
+    }
+
+    /// Lets the user point at Resolve.app directly. Auto-detection covers the normal
+    /// case, so this is an escape hatch rather than a setup step — it exists for
+    /// unusual installs, beta builds, or anything reporting an unexpected bundle id.
+    @objc func selectResolveApp() {
+        let panel = NSOpenPanel()
+        panel.title = "Select DaVinci Resolve"
+        panel.message = "Choose the DaVinci Resolve application."
+        panel.prompt = "Select"
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        guard let id = Bundle(url: url)?.bundleIdentifier else {
+            presentInfo(title: "Not a valid application",
+                        text: "Could not read a bundle identifier from that item.")
+            return
+        }
+        resolveBundleIdOverride = id
+        refreshFrontmostApp()
+        updateStatus()
+        presentInfo(title: "Resolve selected",
+                    text: "ResolveZoom will now act on \(url.lastPathComponent)\n\nBundle identifier:\n\(id)")
+    }
+
+    @objc func clearResolveAppOverride() {
+        resolveBundleIdOverride = ""
+        updateStatus()
+    }
+
+    private func presentInfo(title: String, text: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = text
+        alert.alertStyle = .informational
+        alert.runModal()
+    }
+
+    func refreshFrontmostApp() {
+        guard let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return }
+        // Ignore ourselves. Opening our own menu or Preferences window makes this app
+        // frontmost, which would otherwise clear the cached Resolve state and make the
+        // menu permanently read "Waiting for Resolve…" even while Resolve is in use.
+        if id == Bundle.main.bundleIdentifier { return }
+        cachedFrontmostBundleId = id
     }
 
     // MARK: - Accessibility
@@ -126,6 +231,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             updateStatus()
             startPermissionWatchdog()
         } else {
+            // Tear down any running timer before scheduling a new one. Previously the
+            // 2 s watchdog stayed scheduled while this method overwrote `permissionTimer`
+            // with a fresh 1 s timer — so the watchdog kept firing, kept re-entering
+            // here, and spawned another NSWindow plus another timer every 2 seconds for
+            // as long as the permission was missing.
+            permissionTimer?.invalidate()
+            permissionTimer = nil
+
             // Register app in accessibility list without showing system dialog
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false]
             AXIsProcessTrustedWithOptions(options as CFDictionary)
@@ -136,11 +249,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if AXIsProcessTrusted() {
                     timer.invalidate()
                     DispatchQueue.main.async {
-                        self?.permissionsWindow?.close()
-                        self?.permissionsWindow = nil
-                        self?.setupEventTap()
-                        self?.updateStatus()
-                        self?.startPermissionWatchdog()
+                        guard let self = self else { return }
+                        if self.permissionTimer === timer { self.permissionTimer = nil }
+                        self.closePermissionsWindow()
+                        self.setupEventTap()
+                        self.updateStatus()
+                        self.startPermissionWatchdog()
                     }
                 }
             }
@@ -150,9 +264,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Continuously monitors whether permissions have been revoked while the app is running.
     func startPermissionWatchdog() {
         permissionTimer?.invalidate()
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
+            guard let self = self else { timer.invalidate(); return }
             if !AXIsProcessTrusted() {
+                // Stop this watchdog before handing control back to
+                // checkAccessibilityAndStart(), otherwise both timers stay alive.
+                timer.invalidate()
+                if self.permissionTimer === timer { self.permissionTimer = nil }
                 DispatchQueue.main.async {
                     self.disableEventTap()
                     self.updateStatus()
@@ -167,15 +285,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func disableEventTap() {
         if let tap = tap {
             CGEvent.tapEnable(tap: tap, enable: false)
+            // Without invalidating the mach port, the port and its run-loop source
+            // stay alive after we drop our reference to them.
+            CFMachPortInvalidate(tap)
         }
         if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+            // The source was added to the main run loop, so it has to be removed from
+            // the main run loop — CFRunLoopGetCurrent() would be the wrong loop if this
+            // is ever called off the main thread.
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
         }
         tap = nil
         runLoopSource = nil
     }
 
+    func closePermissionsWindow() {
+        let w = permissionsWindow
+        permissionsWindow = nil
+        w?.orderOut(nil)
+        w?.close()
+    }
+
     func showPermissionsWindow() {
+        // Reuse the existing window instead of stacking up new ones. The window is
+        // created with `isReleasedWhenClosed = false`, so every extra instance stayed
+        // retained for the lifetime of the app.
+        if let existing = permissionsWindow {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
         let w = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 440, height: 190),
             styleMask: [.titled, .closable],
@@ -232,94 +372,157 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setupEventTap() {
         disableEventTap() // clean up any previous tap first
 
-        let selfPtr = Unmanaged.passRetained(self).toOpaque()
+        // `passUnretained`, not `passRetained`: this delegate lives for the whole app
+        // lifetime, and a retained pointer here leaked one AppDelegate every time the
+        // tap was rebuilt.
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
+        // MEMORY MANAGEMENT CONTRACT of CGEventTapCallBack:
+        //
+        // The `event` argument is owned by the system. When we pass it through
+        // unchanged we must return an *unretained* reference. Returning
+        // `Unmanaged.passRetained(event)` adds a +1 retain that nothing ever balances,
+        // so every scroll and magnify event flowing through the tap was leaked. Under
+        // sustained trackpad use that is thousands of leaked CGEvents per minute — the
+        // cause of the unbounded memory growth reported by users (22 MB → 60 MB → GBs
+        // over a long editing session).
+        //
+        // Only return `passRetained` for an event *we* created and are handing
+        // ownership of to the system.
         let callback: CGEventTapCallBack = { proxy, type, event, userInfoPtr in
-            guard let ptr = userInfoPtr else { return Unmanaged.passRetained(event) }
-            let delegate = Unmanaged<AppDelegate>.fromOpaque(ptr).takeUnretainedValue()
+            // Drain autoreleased temporaries immediately instead of letting them pile
+            // up until the next run-loop turn. This callback fires 60–120 times a
+            // second during a pinch.
+            return autoreleasepool { () -> Unmanaged<CGEvent>? in
+                guard let ptr = userInfoPtr else { return Unmanaged.passUnretained(event) }
+                let delegate = Unmanaged<AppDelegate>.fromOpaque(ptr).takeUnretainedValue()
 
-            // Handle tap being disabled (e.g. accessibility permission revoked)
-            if type == .tapDisabledByUserInput || type == .tapDisabledByTimeout {
-                DispatchQueue.main.async {
-                    if AXIsProcessTrusted(), let tap = delegate.tap {
-                        // Permission still valid — just re-enable the tap
-                        CGEvent.tapEnable(tap: tap, enable: true)
-                    } else {
-                        // Permission lost — remove tap to unblock mouse events
-                        delegate.disableEventTap()
-                        delegate.updateStatus()
-                        delegate.checkAccessibilityAndStart()
+                // Handle tap being disabled (e.g. accessibility permission revoked)
+                if type == .tapDisabledByUserInput || type == .tapDisabledByTimeout {
+                    DispatchQueue.main.async {
+                        if AXIsProcessTrusted(), let tap = delegate.tap {
+                            // Permission still valid — just re-enable the tap
+                            CGEvent.tapEnable(tap: tap, enable: true)
+                        } else {
+                            // Permission lost — remove tap to unblock mouse events
+                            delegate.disableEventTap()
+                            delegate.updateStatus()
+                            delegate.checkAccessibilityAndStart()
+                        }
                     }
+                    return Unmanaged.passUnretained(event)
                 }
-                return Unmanaged.passRetained(event)
-            }
 
-            let kMagnify = CGEventType(rawValue: 29)!
-            let kField = CGEventField(rawValue: 113)!
+                let kMagnify = CGEventType(rawValue: 29)!
+                let kField = CGEventField(rawValue: 113)!
 
-            // Detect horizontal scroll from mouse side wheel — record timestamp and pass through
-            if type == CGEventType.scrollWheel {
-                let deltaH1 = event.getDoubleValueField(CGEventField(rawValue: 12)!)  // discrete axis2
-                let deltaH2 = event.getDoubleValueField(CGEventField(rawValue: 97)!)  // precise axis2
-                if abs(deltaH1) > 0 || abs(deltaH2) > 0 {
-                    delegate.lastHorizontalScrollTime = CFAbsoluteTimeGetCurrent()
+                // Detect horizontal scroll from mouse side wheel — record timestamp and pass through
+                if type == CGEventType.scrollWheel {
+                    let deltaH1 = event.getDoubleValueField(CGEventField(rawValue: 12)!)  // discrete axis2
+                    let deltaH2 = event.getDoubleValueField(CGEventField(rawValue: 97)!)  // precise axis2
+                    if abs(deltaH1) > 0 || abs(deltaH2) > 0 {
+                        delegate.lastHorizontalScrollTime = CFAbsoluteTimeGetCurrent()
+                    }
+                    return Unmanaged.passUnretained(event)
                 }
-                return Unmanaged.passRetained(event)
+
+                guard type == kMagnify else { return Unmanaged.passUnretained(event) }
+
+                delegate.magnifyEventsSeen += 1
+
+                // If horizontal scroll happened within last 100ms, this magnify is a mouse artifact
+                if CFAbsoluteTimeGetCurrent() - delegate.lastHorizontalScrollTime < 0.1 {
+                    delegate.lastSkipReason = "horizontal scroll artifact"
+                    return Unmanaged.passUnretained(event)
+                }
+                // Cached — refreshed on didActivateApplicationNotification.
+                guard delegate.isResolveApp(delegate.cachedFrontmostBundleId) else {
+                    delegate.lastSkipReason = "not Resolve (\(delegate.cachedFrontmostBundleId ?? "unknown"))"
+                    return Unmanaged.passUnretained(event)
+                }
+
+                // Never interfere while a mouse button is held: the user is dragging —
+                // e.g. pulling a clip into the timeline — and a stray pinch would make us
+                // inject Option-flagged scroll events into an active drag, which Resolve
+                // reinterprets as a modified drag. Reported as clips stretching/folding
+                // and the cursor jumping around.
+                if CGEventSource.buttonState(.combinedSessionState, button: .left)
+                    || CGEventSource.buttonState(.combinedSessionState, button: .right) {
+                    delegate.lastSkipReason = "mouse button held (drag in progress)"
+                    // Drop any partial gesture state so the drag can't seed the next zoom.
+                    delegate.zoomAccumulator = 0
+                    delegate.consecutiveMagnifyCount = 0
+                    return Unmanaged.passUnretained(event)
+                }
+
+                let mag = event.getDoubleValueField(kField)
+                delegate.lastMagnifyMagnitude = mag
+                guard abs(mag) < 0.5 && abs(mag) > 0.005 else {
+                    delegate.lastSkipReason = "magnitude out of range"
+                    return Unmanaged.passUnretained(event)
+                }
+
+                // Consecutive event counter: require sustained stream of events (real pinch)
+                // before triggering zoom — clicks generate only 1-2 events
+                let now = CFAbsoluteTimeGetCurrent()
+                // Captured *before* lastMagnifyTime is overwritten. Previously the
+                // quick-flip check below compared `now` against a value that had just
+                // been set to `now`, so the elapsed time was always 0 and the check was
+                // dead code.
+                let timeSinceLastMagnify = now - delegate.lastMagnifyTime
+
+                if timeSinceLastMagnify > delegate.magnifyTimeWindow {
+                    delegate.consecutiveMagnifyCount = 0
+                    delegate.zoomAccumulator = 0
+                }
+                delegate.consecutiveMagnifyCount += 1
+                delegate.lastMagnifyTime = now
+                guard delegate.consecutiveMagnifyCount >= delegate.magnifyCountThreshold else {
+                    return Unmanaged.passUnretained(event)
+                }
+
+                // Filter scroll artifacts: real pinch gestures don't flip direction within 100ms
+                let currentSign = mag > 0 ? 1.0 : -1.0
+                let isSignFlip = currentSign != delegate.lastMagnifySign && delegate.lastMagnifySign != 0
+                let isQuickFlip = timeSinceLastMagnify < 0.1
+                delegate.lastMagnifySign = currentSign
+                if isSignFlip && isQuickFlip {
+                    // Drop the stale remainder so it can't leak into the new direction.
+                    delegate.zoomAccumulator = 0
+                    return Unmanaged.passUnretained(event)
+                }
+
+                let direction: Double = delegate.invertZoom ? 1.0 : -1.0
+
+                // Accumulate in floating point and only emit whole pixels, carrying the
+                // remainder forward. A bare Int32(delta) truncated anything below 1.0 to
+                // zero, so slow pinches at low sensitivity dropped out entirely.
+                delegate.zoomAccumulator += mag * direction * delegate.multiplier
+                // Defensive clamp — Int32() traps on out-of-range values.
+                delegate.zoomAccumulator = max(-100_000, min(100_000, delegate.zoomAccumulator))
+                let intDelta = Int32(delegate.zoomAccumulator)
+                guard intDelta != 0 else { return Unmanaged.passUnretained(event) }
+                delegate.zoomAccumulator -= Double(intDelta)
+
+                // Bierzemy pozycję kursora wprost z eventu magnify — już jest w układzie CGEvent,
+                // działa poprawnie na wszystkich monitorach bez ręcznej konwersji współrzędnych
+                let cgPoint = event.location
+
+                guard let scrollEvent = CGEvent(
+                    scrollWheelEvent2Source: nil, units: .pixel,
+                    wheelCount: 1, wheel1: intDelta, wheel2: 0, wheel3: 0
+                ) else { return Unmanaged.passUnretained(event) }
+
+                scrollEvent.flags = .maskAlternate
+                scrollEvent.location = cgPoint
+                scrollEvent.post(tap: .cghidEventTap)
+                delegate.magnifyEventsActedOn += 1
+                delegate.lastSkipReason = "—"
+                // Swallow the original magnify event. `scrollEvent` is ARC-managed and
+                // released when this closure returns — posting already handed a copy to
+                // the system.
+                return nil
             }
-
-            guard type == kMagnify else { return Unmanaged.passRetained(event) }
-
-            // If horizontal scroll happened within last 100ms, this magnify is a mouse artifact
-            if CFAbsoluteTimeGetCurrent() - delegate.lastHorizontalScrollTime < 0.1 {
-                return Unmanaged.passRetained(event)
-            }
-            guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-                    == "com.blackmagic-design.DaVinciResolve" else {
-                return Unmanaged.passRetained(event)
-            }
-
-            let mag = event.getDoubleValueField(kField)
-            guard abs(mag) < 0.5 && abs(mag) > 0.005 else {
-                return Unmanaged.passRetained(event)
-            }
-
-            // Consecutive event counter: require sustained stream of events (real pinch)
-            // before triggering zoom — clicks generate only 1-2 events
-            let now = CFAbsoluteTimeGetCurrent()
-            if now - delegate.lastMagnifyTime > delegate.magnifyTimeWindow {
-                delegate.consecutiveMagnifyCount = 0
-            }
-            delegate.consecutiveMagnifyCount += 1
-            delegate.lastMagnifyTime = now
-            guard delegate.consecutiveMagnifyCount >= delegate.magnifyCountThreshold else {
-                return Unmanaged.passRetained(event)
-            }
-
-            // Filter scroll artifacts: real pinch gestures don't flip direction within 100ms
-            let currentSign = mag > 0 ? 1.0 : -1.0
-            let isSignFlip = currentSign != delegate.lastMagnifySign && delegate.lastMagnifySign != 0
-            let isQuickFlip = (now - delegate.lastMagnifyTime) < 0.1
-            delegate.lastMagnifySign = currentSign
-            if isSignFlip && isQuickFlip {
-                return Unmanaged.passRetained(event)
-            }
-
-            let direction: Double = delegate.invertZoom ? 1.0 : -1.0
-            let delta = mag * direction * delegate.multiplier
-
-            // Bierzemy pozycję kursora wprost z eventu magnify — już jest w układzie CGEvent,
-            // działa poprawnie na wszystkich monitorach bez ręcznej konwersji współrzędnych
-            let cgPoint = event.location
-
-            guard let scrollEvent = CGEvent(
-                scrollWheelEvent2Source: nil, units: .pixel,
-                wheelCount: 1, wheel1: Int32(delta), wheel2: 0, wheel3: 0
-            ) else { return Unmanaged.passRetained(event) }
-
-            scrollEvent.flags = .maskAlternate
-            scrollEvent.location = cgPoint
-            scrollEvent.post(tap: .cghidEventTap)
-            return nil
         }
 
         let mask: CGEventMask = (1 << 29) | (1 << 22) // magnify + scroll wheel
@@ -333,7 +536,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         guard let tap = tap else { return }
         runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
+        CFRunLoopAddSource(CFRunLoopGetMain(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
@@ -354,7 +557,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let titleItem = NSMenuItem()
         let titleStr = NSMutableAttributedString(string: "ResolveZoom\n",
                                                  attributes: [.font: NSFont.boldSystemFont(ofSize: 13)])
-        titleStr.append(NSAttributedString(string: "Version: 0.3  ·  © Marcin Kuśnierz",
+        // Read from the bundle so the menu can never drift out of sync with Info.plist.
+        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        titleStr.append(NSAttributedString(string: "Version: \(appVersion)  ·  © Marcin Kuśnierz",
                                            attributes: [
                                                .font: NSFont.systemFont(ofSize: 10),
                                                .foregroundColor: NSColor.secondaryLabelColor
@@ -369,15 +574,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
 
+        // Diagnostics line. Refreshed in menuWillOpen, so a user who reports "nothing
+        // happens" can read off exactly what the app sees instead of us guessing.
+        diagnosticsMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        diagnosticsMenuItem.isEnabled = false
+        menu.addItem(diagnosticsMenuItem)
+
         menu.addItem(.separator())
 
         let prefsItem = NSMenuItem(title: "Preferences…", action: #selector(openPreferences), keyEquivalent: ",")
         menu.addItem(prefsItem)
 
+        selectResolveMenuItem = NSMenuItem(title: "Select DaVinci Resolve…",
+                                           action: #selector(selectResolveApp), keyEquivalent: "")
+        menu.addItem(selectResolveMenuItem)
+
+        clearResolveMenuItem = NSMenuItem(title: "Use automatic detection",
+                                          action: #selector(clearResolveAppOverride), keyEquivalent: "")
+        menu.addItem(clearResolveMenuItem)
+
         menu.addItem(.separator())
 
         menu.addItem(NSMenuItem(title: "Quit ResolveZoom", action: #selector(quit), keyEquivalent: "q"))
 
+        menu.delegate = self
         statusItem.menu = menu
 
         NSWorkspace.shared.notificationCenter.addObserver(
@@ -422,7 +642,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Status
     @objc func activeAppChanged() {
-        DispatchQueue.main.async { self.updateStatus() }
+        DispatchQueue.main.async {
+            // Keep the cached bundle id in sync so the tap callback never has to ask.
+            self.refreshFrontmostApp()
+            self.updateStatus()
+        }
+    }
+
+    /// Refresh right before the menu is drawn. Previously the status was only recomputed
+    /// on app-activation notifications, so whatever it happened to say could be stale by
+    /// the time the user actually looked at it.
+    func menuWillOpen(_ menu: NSMenu) {
+        updateStatus()
+        updateDiagnostics()
+        clearResolveMenuItem?.isHidden = resolveBundleIdOverride.isEmpty
     }
 
     func updateStatus() {
@@ -431,15 +664,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if !AXIsProcessTrusted() {
                 return ("⬤  No accessibility permission", .systemRed)
             }
-            let isResolve = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
-                == "com.blackmagic-design.DaVinciResolve"
-            return isResolve
+            // Uses the cached id, which deliberately ignores this app itself — opening
+            // this very menu would otherwise make us the frontmost app and the line
+            // would always read "Waiting for Resolve…".
+            return isResolveApp(cachedFrontmostBundleId)
                 ? ("⬤  DaVinci Resolve active", .systemGreen)
                 : ("⬤  Waiting for Resolve…", .secondaryLabelColor)
         }()
         item.attributedTitle = NSAttributedString(string: text, attributes: [
             .foregroundColor: color,
             .font: NSFont.systemFont(ofSize: 13)
+        ])
+    }
+
+    func updateDiagnostics() {
+        guard let item = diagnosticsMenuItem else { return }
+        let seenApp = cachedFrontmostBundleId ?? "unknown"
+        let matching = resolveBundleIdOverride.isEmpty
+            ? "auto (com.blackmagic-design.DaVinciResolve*)"
+            : resolveBundleIdOverride
+        let lines = """
+        Frontmost app: \(seenApp)
+        Matching: \(matching)
+        Pinch events: \(magnifyEventsSeen) seen · \(magnifyEventsActedOn) used
+        Last magnitude: \(String(format: "%.4f", lastMagnifyMagnitude))
+        Last skip: \(lastSkipReason)
+        """
+        item.attributedTitle = NSAttributedString(string: lines, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor
         ])
     }
 
