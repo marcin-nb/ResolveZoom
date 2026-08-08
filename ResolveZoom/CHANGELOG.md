@@ -71,6 +71,15 @@ during long editing sessions. Several gesture bugs were fixed along the way.
 Tested on macOS 26 Tahoe with DaVinci Resolve 21.0.4. Memory was verified to stay
 flat across extended pinching and repeated permission grant/revoke cycles.
 
+Thanks to [@SnackForever](https://github.com/SnackForever), who independently
+identified the `passRetained` leaks, the dead `isQuickFlip` check, the truncated
+sub-pixel movement, and the per-event lookups in [#3]. Those fixes are implemented
+here rather than merged, because this release reworks the same code paths.
+
+Thanks also to paolog2946 on YouTube for the memory report that started this.
+
+[#3]: https://github.com/marcin-nb/ResolveZoom/pull/3
+
 [#1]: https://github.com/marcin-nb/ResolveZoom/issues/1
 [#2]: https://github.com/marcin-nb/ResolveZoom/issues/2
 [reported on YouTube]: https://github.com/marcin-nb/ResolveZoom
