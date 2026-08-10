@@ -775,7 +775,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             kAXChildrenAttribute as CFString, from: element, timeout: timeout, deadline: deadline)
         {
         case .value(let value) where CFGetTypeID(value) == CFArrayGetTypeID():
-            let children = value as! [AXUIElement]
+guard let children = value as? [AXUIElement] else { return .unavailable }
             for child in children {
                 let result = scanForActivePage(
                     in: child, depth: depth + 1, maxDepth: maxDepth,
