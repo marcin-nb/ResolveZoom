@@ -1,3 +1,4 @@
+import ApplicationServices
 import Cocoa
 import SwiftUI
 import UniformTypeIdentifiers
@@ -12,9 +13,11 @@ struct PreferencesView: View {
 
     private let defaultMultiplier = 800.0
 
-    init(multiplier: Double, invertZoom: Bool, launchAtLogin: Bool,
-         onSave: @escaping (Double, Bool, Bool) -> Void,
-         onCancel: @escaping () -> Void) {
+    init(
+        multiplier: Double, invertZoom: Bool, launchAtLogin: Bool,
+        onSave: @escaping (Double, Bool, Bool) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
         _multiplier = State(initialValue: multiplier)
         _invertZoom = State(initialValue: invertZoom)
         _launchAtLogin = State(initialValue: launchAtLogin)
@@ -43,8 +46,9 @@ struct PreferencesView: View {
                 }
                 .padding(12)
                 .frame(maxWidth: .infinity)
-                .background(RoundedRectangle(cornerRadius: 10)
-                    .fill(Color(NSColor.controlBackgroundColor)))
+                .background(
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color(NSColor.controlBackgroundColor)))
             }
             .padding(.horizontal, 16)
             .padding(.top, 16)
@@ -83,6 +87,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var tap: CFMachPort?
     var runLoopSource: CFRunLoopSource?
     var permissionTimer: Timer?
+    private var fusionPollTimer: DispatchSourceTimer?
 
     var statusMenuItem: NSMenuItem!
     var diagnosticsMenuItem: NSMenuItem!
@@ -142,6 +147,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         didSet { defaults.set(resolveBundleIdOverride, forKey: "resolveBundleIdOverride") }
     }
 
+    // This state is deliberately main-thread-only. The AX walk returns to the main
+    // queue before changing it, and the event tap itself is attached to the main run
+    // loop, so the hot path never needs a lock or performs an AX call.
+    private var isPausedForFusion = false
+    private var activeResolvePage: String?
+    private var activeFusionScanID: UUID?
+    private var fusionPollingGeneration = 0
+    private let fusionPollQueue = DispatchQueue(
+        label: "com.resolvezoom.fusion-page-poll", qos: .utility)
+    private let fusionPollInterval: TimeInterval = 1.0
+    private let axMessagingTimeout: Float = 0.05
+    private static let resolvePageNames: Set<String> = [
+        "Media", "Cut", "Edit", "Fusion", "Color", "Fairlight", "Deliver",
+    ]
+
     /// Matches DaVinci Resolve. If the user pinned a specific app, only that one counts.
     /// Otherwise fall back to a prefix match: Blackmagic ships one bundle for both the
     /// free and Studio editions, but betas and future builds may differ, and a prefix
@@ -167,7 +187,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Reads persisted settings once at launch. Uses the same UserDefaults keys as
     /// before, so existing users keep their configuration.
     func loadSettings() {
-        multiplier = defaults.object(forKey: "multiplier") == nil
+        multiplier =
+            defaults.object(forKey: "multiplier") == nil
             ? defaultMultiplier
             : defaults.double(forKey: "multiplier")
         invertZoom = defaults.bool(forKey: "invertZoom")
@@ -191,15 +212,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         guard let id = Bundle(url: url)?.bundleIdentifier else {
-            presentInfo(title: "Not a valid application",
-                        text: "Could not read a bundle identifier from that item.")
+            presentInfo(
+                title: "Not a valid application",
+                text: "Could not read a bundle identifier from that item.")
             return
         }
         resolveBundleIdOverride = id
         refreshFrontmostApp()
         updateStatus()
-        presentInfo(title: "Resolve selected",
-                    text: "ResolveZoom will now act on \(url.lastPathComponent)\n\nBundle identifier:\n\(id)")
+        presentInfo(
+            title: "Resolve selected",
+            text:
+                "ResolveZoom will now act on \(url.lastPathComponent)\n\nBundle identifier:\n\(id)")
     }
 
     @objc func clearResolveAppOverride() {
@@ -228,6 +252,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func checkAccessibilityAndStart() {
         if AXIsProcessTrusted() {
             setupEventTap()
+            startFusionPolling()
             updateStatus()
             startPermissionWatchdog()
         } else {
@@ -245,7 +270,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             showPermissionsWindow()
 
-            permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] timer in
+            permissionTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) {
+                [weak self] timer in
                 if AXIsProcessTrusted() {
                     timer.invalidate()
                     DispatchQueue.main.async {
@@ -264,8 +290,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Continuously monitors whether permissions have been revoked while the app is running.
     func startPermissionWatchdog() {
         permissionTimer?.invalidate()
-        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
-            guard let self = self else { timer.invalidate(); return }
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) {
+            [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
             if !AXIsProcessTrusted() {
                 // Stop this watchdog before handing control back to
                 // checkAccessibilityAndStart(), otherwise both timers stay alive.
@@ -283,6 +313,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Safely removes the event tap from the run loop and releases it.
     /// MUST be called before permissions are considered lost — prevents mouse click blocking.
     func disableEventTap() {
+        stopFusionPolling()
         if let tap = tap {
             CGEvent.tapEnable(tap: tap, enable: false)
             // Without invalidating the mach port, the port and its run-loop source
@@ -339,7 +370,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         titleLabel.font = NSFont.boldSystemFont(ofSize: 14)
         cv.addSubview(titleLabel)
 
-        let desc = NSTextField(wrappingLabelWithString: "ResolveZoom needs Accessibility access to detect pinch gestures. Click the button below, then find ResolveZoom in the list and toggle the switch ON.")
+        let desc = NSTextField(
+            wrappingLabelWithString:
+                "ResolveZoom needs Accessibility access to detect pinch gestures. Click the button below, then find ResolveZoom in the list and toggle the switch ON."
+        )
         desc.frame = NSRect(x: 82, y: 82, width: 340, height: 60)
         desc.font = NSFont.systemFont(ofSize: 12)
         desc.textColor = .secondaryLabelColor
@@ -350,7 +384,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         quitBtn.bezelStyle = .rounded
         cv.addSubview(quitBtn)
 
-        let openBtn = NSButton(title: "Open Accessibility Settings", target: self, action: #selector(openAccessibilitySettings))
+        let openBtn = NSButton(
+            title: "Open Accessibility Settings", target: self,
+            action: #selector(openAccessibilitySettings))
         openBtn.frame = NSRect(x: 220, y: 24, width: 200, height: 32)
         openBtn.bezelStyle = .rounded
         openBtn.keyEquivalent = "\r"
@@ -363,14 +399,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func openAccessibilitySettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+        if let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+        {
             NSWorkspace.shared.open(url)
         }
     }
 
     // MARK: - Event Tap
     func setupEventTap() {
-        disableEventTap() // clean up any previous tap first
+        disableEventTap()  // clean up any previous tap first
 
         // `passUnretained`, not `passRetained`: this delegate lives for the whole app
         // lifetime, and a retained pointer here leaked one AppDelegate every time the
@@ -437,7 +475,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 // Cached — refreshed on didActivateApplicationNotification.
                 guard delegate.isResolveApp(delegate.cachedFrontmostBundleId) else {
-                    delegate.lastSkipReason = "not Resolve (\(delegate.cachedFrontmostBundleId ?? "unknown"))"
+                    delegate.lastSkipReason =
+                        "not Resolve (\(delegate.cachedFrontmostBundleId ?? "unknown"))"
+                    return Unmanaged.passUnretained(event)
+                }
+
+                // Fusion handles pinch-to-zoom natively. Pass the original event through
+                // rather than injecting an Alt-scroll event intended for the timeline.
+                if delegate.isPausedForFusion {
+                    delegate.lastSkipReason = "Fusion page (native pinch zoom)"
+                    delegate.zoomAccumulator = 0
+                    delegate.consecutiveMagnifyCount = 0
                     return Unmanaged.passUnretained(event)
                 }
 
@@ -447,7 +495,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // reinterprets as a modified drag. Reported as clips stretching/folding
                 // and the cursor jumping around.
                 if CGEventSource.buttonState(.combinedSessionState, button: .left)
-                    || CGEventSource.buttonState(.combinedSessionState, button: .right) {
+                    || CGEventSource.buttonState(.combinedSessionState, button: .right)
+                {
                     delegate.lastSkipReason = "mouse button held (drag in progress)"
                     // Drop any partial gesture state so the drag can't seed the next zoom.
                     delegate.zoomAccumulator = 0
@@ -483,7 +532,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 // Filter scroll artifacts: real pinch gestures don't flip direction within 100ms
                 let currentSign = mag > 0 ? 1.0 : -1.0
-                let isSignFlip = currentSign != delegate.lastMagnifySign && delegate.lastMagnifySign != 0
+                let isSignFlip =
+                    currentSign != delegate.lastMagnifySign && delegate.lastMagnifySign != 0
                 let isQuickFlip = timeSinceLastMagnify < 0.1
                 delegate.lastMagnifySign = currentSign
                 if isSignFlip && isQuickFlip {
@@ -508,10 +558,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // działa poprawnie na wszystkich monitorach bez ręcznej konwersji współrzędnych
                 let cgPoint = event.location
 
-                guard let scrollEvent = CGEvent(
-                    scrollWheelEvent2Source: nil, units: .pixel,
-                    wheelCount: 1, wheel1: intDelta, wheel2: 0, wheel3: 0
-                ) else { return Unmanaged.passUnretained(event) }
+                guard
+                    let scrollEvent = CGEvent(
+                        scrollWheelEvent2Source: nil, units: .pixel,
+                        wheelCount: 1, wheel1: intDelta, wheel2: 0, wheel3: 0
+                    )
+                else { return Unmanaged.passUnretained(event) }
 
                 scrollEvent.flags = .maskAlternate
                 scrollEvent.location = cgPoint
@@ -525,7 +577,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        let mask: CGEventMask = (1 << 29) | (1 << 22) // magnify + scroll wheel
+        let mask: CGEventMask = (1 << 29) | (1 << 22)  // magnify + scroll wheel
         tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
@@ -540,13 +592,250 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
+    // MARK: - Fusion page detection
+
+    /// Starts a lightweight main-queue timer. The timer only captures the current
+    /// PID; all Accessibility IPC happens on `fusionPollQueue`.
+    private func startFusionPolling() {
+        stopFusionPolling()
+        fusionPollingGeneration += 1
+        scheduleFusionPagePoll()
+
+        // Use a dispatch timer instead of a run-loop Timer. The latter can stop
+        // firing while the app is in another run-loop mode (desktop/focus changes,
+        // tracking, or menu interaction). This timer only schedules work; AX IPC
+        // still runs exclusively on fusionPollQueue.
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + fusionPollInterval,
+            repeating: fusionPollInterval,
+            leeway: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            self?.scheduleFusionPagePoll()
+        }
+        timer.resume()
+        fusionPollTimer = timer
+    }
+
+    private func stopFusionPolling() {
+        fusionPollTimer?.cancel()
+        fusionPollTimer = nil
+        fusionPollingGeneration += 1
+        activeFusionScanID = nil
+    }
+
+    /// This function runs on the main queue. It does not call AX APIs, preventing
+    /// Resolve from ever delaying the event tap or menu/UI work.
+    private func scheduleFusionPagePoll() {
+        precondition(Thread.isMainThread)
+        guard activeFusionScanID == nil, AXIsProcessTrusted() else { return }
+        guard
+            let resolve = NSWorkspace.shared.runningApplications.first(where: {
+                $0.isActive && isResolveApp($0.bundleIdentifier)
+            })
+        else { return }
+
+        let scanID = UUID()
+        let generation = fusionPollingGeneration
+        let pid = resolve.processIdentifier
+        let timeout = axMessagingTimeout
+        activeFusionScanID = scanID
+
+        fusionPollQueue.async { [weak self] in
+            let result = AppDelegate.scanActiveResolvePage(pid: pid, timeout: timeout)
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self, self.activeFusionScanID == scanID else { return }
+                self.activeFusionScanID = nil
+                guard self.fusionPollingGeneration == generation else { return }
+                self.applyFusionPageScanResult(result)
+            }
+        }
+    }
+
+    /// Applies results only after a confirmed page change. A missing element or a
+    /// timed-out AX request leaves the last known page untouched, which is safer than
+    /// accidentally re-enabling interception while Resolve is loading Fusion.
+    private func applyFusionPageScanResult(_ result: FusionPageScanResult) {
+        precondition(Thread.isMainThread)
+        guard case .page(let page) = result, page != activeResolvePage else { return }
+
+        activeResolvePage = page
+        let shouldPause = page.caseInsensitiveCompare("Fusion") == .orderedSame
+        guard shouldPause != isPausedForFusion else { return }
+
+        isPausedForFusion = shouldPause
+        zoomAccumulator = 0
+        consecutiveMagnifyCount = 0
+    }
+
+    private enum FusionPageScanResult {
+        case page(String)
+        case noActivePage
+        case unavailable
+    }
+
+    private enum AXAttributeValue {
+        case value(CFTypeRef)
+        case missing
+        case unavailable
+    }
+
+    /// Performs a bounded scan of Resolve's current AX tree. This function is called
+    /// only from `fusionPollQueue`; no AXUIElement references are retained or shared.
+    private static func scanActiveResolvePage(
+        pid: pid_t, timeout: Float
+    ) -> FusionPageScanResult {
+        // The per-message timeout protects each synchronous IPC call. The additional
+        // budget caps the entire recursive pass, so a large AX tree cannot monopolize
+        // even the utility queue when Resolve is slow.
+        let deadline = Date().addingTimeInterval(0.25)
+        let application = AXUIElementCreateApplication(pid)
+        guard setMessagingTimeout(application, timeout: timeout) else { return .unavailable }
+
+        let mainWindow: AXUIElement
+        switch copyAttribute(
+            kAXMainWindowAttribute as CFString, from: application, timeout: timeout,
+            deadline: deadline)
+        {
+        case .value(let value) where CFGetTypeID(value) == AXUIElementGetTypeID():
+            mainWindow = value as! AXUIElement
+        case .missing:
+            switch copyAttribute(
+                kAXFocusedWindowAttribute as CFString, from: application, timeout: timeout,
+                deadline: deadline)
+            {
+            case .value(let value) where CFGetTypeID(value) == AXUIElementGetTypeID():
+                mainWindow = value as! AXUIElement
+            default:
+                return .unavailable
+            }
+        default:
+            return .unavailable
+        }
+
+        return scanForActivePage(
+            in: mainWindow, depth: 0, maxDepth: 10, timeout: timeout, deadline: deadline)
+    }
+
+    private static func scanForActivePage(
+        in element: AXUIElement,
+        depth: Int,
+        maxDepth: Int,
+        timeout: Float,
+        deadline: Date
+    ) -> FusionPageScanResult {
+        guard depth <= maxDepth, Date() <= deadline else { return .unavailable }
+
+        switch copyAttribute(
+            kAXRoleAttribute as CFString, from: element, timeout: timeout, deadline: deadline)
+        {
+        case .value(let value) where (value as? String) == "AXCheckBox":
+            let pageName: String
+            switch copyAttribute(
+                kAXTitleAttribute as CFString, from: element, timeout: timeout, deadline: deadline)
+            {
+            case .value(let value) where !(value as? String ?? "").isEmpty:
+                pageName = value as! String
+            case .missing, .value(_):
+                switch copyAttribute(
+                    kAXDescriptionAttribute as CFString, from: element, timeout: timeout,
+                    deadline: deadline)
+                {
+                case .value(let value) where !(value as? String ?? "").isEmpty:
+                    pageName = value as! String
+                case .unavailable:
+                    return .unavailable
+                default:
+                    pageName = ""
+                }
+            case .unavailable:
+                return .unavailable
+            }
+
+            if Self.resolvePageNames.contains(pageName) {
+                switch copyAttribute(
+                    kAXValueAttribute as CFString, from: element, timeout: timeout,
+                    deadline: deadline)
+                {
+                case .value(let value) where isSelectedPageValue(value):
+                    return .page(pageName)
+                case .unavailable:
+                    return .unavailable
+                default:
+                    break
+                }
+            }
+        case .unavailable:
+            return .unavailable
+        default:
+            break
+        }
+
+        switch copyAttribute(
+            kAXChildrenAttribute as CFString, from: element, timeout: timeout, deadline: deadline)
+        {
+        case .value(let value) where CFGetTypeID(value) == CFArrayGetTypeID():
+            let children = value as! [AXUIElement]
+            for child in children {
+                let result = scanForActivePage(
+                    in: child, depth: depth + 1, maxDepth: maxDepth,
+                    timeout: timeout, deadline: deadline)
+                switch result {
+                case .page, .unavailable:
+                    return result
+                case .noActivePage:
+                    continue
+                }
+            }
+        case .unavailable:
+            return .unavailable
+        default:
+            break
+        }
+
+        return .noActivePage
+    }
+
+    private static func copyAttribute(
+        _ attribute: CFString,
+        from element: AXUIElement,
+        timeout: Float,
+        deadline: Date
+    ) -> AXAttributeValue {
+        guard Date() <= deadline, setMessagingTimeout(element, timeout: timeout) else {
+            return .unavailable
+        }
+
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+        switch error {
+        case .success:
+            return value.map(AXAttributeValue.value) ?? .missing
+        case .noValue, .attributeUnsupported:
+            return .missing
+        default:
+            return .unavailable
+        }
+    }
+
+    private static func setMessagingTimeout(_ element: AXUIElement, timeout: Float) -> Bool {
+        AXUIElementSetMessagingTimeout(element, timeout) == .success
+    }
+
+    private static func isSelectedPageValue(_ value: CFTypeRef) -> Bool {
+        if let boolValue = value as? Bool { return boolValue }
+        if let number = value as? NSNumber { return number.intValue == 1 }
+        return false
+    }
+
     // MARK: - Menu Bar
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.isVisible = true
         if let btn = statusItem.button {
-            let img = NSImage(systemSymbolName: "arrow.up.left.and.arrow.down.right",
-                              accessibilityDescription: "ResolveZoom")
+            let img = NSImage(
+                systemSymbolName: "arrow.up.left.and.arrow.down.right",
+                accessibilityDescription: "ResolveZoom")
             img?.isTemplate = true
             btn.image = img
         }
@@ -555,15 +844,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.autoenablesItems = false
 
         let titleItem = NSMenuItem()
-        let titleStr = NSMutableAttributedString(string: "ResolveZoom\n",
-                                                 attributes: [.font: NSFont.boldSystemFont(ofSize: 13)])
+        let titleStr = NSMutableAttributedString(
+            string: "ResolveZoom\n",
+            attributes: [.font: NSFont.boldSystemFont(ofSize: 13)])
         // Read from the bundle so the menu can never drift out of sync with Info.plist.
         let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-        titleStr.append(NSAttributedString(string: "Version: \(appVersion)  ·  © Marcin Kuśnierz",
-                                           attributes: [
-                                               .font: NSFont.systemFont(ofSize: 10),
-                                               .foregroundColor: NSColor.secondaryLabelColor
-                                           ]))
+        titleStr.append(
+            NSAttributedString(
+                string: "Version: \(appVersion)  ·  © Marcin Kuśnierz",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 10),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]))
         titleItem.attributedTitle = titleStr
         titleItem.isEnabled = false
         menu.addItem(titleItem)
@@ -582,20 +874,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        let prefsItem = NSMenuItem(title: "Preferences…", action: #selector(openPreferences), keyEquivalent: ",")
+        let prefsItem = NSMenuItem(
+            title: "Preferences…", action: #selector(openPreferences), keyEquivalent: ",")
         menu.addItem(prefsItem)
 
-        selectResolveMenuItem = NSMenuItem(title: "Select DaVinci Resolve…",
-                                           action: #selector(selectResolveApp), keyEquivalent: "")
+        selectResolveMenuItem = NSMenuItem(
+            title: "Select DaVinci Resolve…",
+            action: #selector(selectResolveApp), keyEquivalent: "")
         menu.addItem(selectResolveMenuItem)
 
-        clearResolveMenuItem = NSMenuItem(title: "Use automatic detection",
-                                          action: #selector(clearResolveAppOverride), keyEquivalent: "")
+        clearResolveMenuItem = NSMenuItem(
+            title: "Use automatic detection",
+            action: #selector(clearResolveAppOverride), keyEquivalent: "")
         menu.addItem(clearResolveMenuItem)
 
         menu.addItem(.separator())
 
-        menu.addItem(NSMenuItem(title: "Quit ResolveZoom", action: #selector(quit), keyEquivalent: "q"))
+        menu.addItem(
+            NSMenuItem(title: "Quit ResolveZoom", action: #selector(quit), keyEquivalent: "q"))
 
         menu.delegate = self
         statusItem.menu = menu
@@ -645,6 +941,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.async {
             // Keep the cached bundle id in sync so the tap callback never has to ask.
             self.refreshFrontmostApp()
+            self.scheduleFusionPagePoll()
             self.updateStatus()
         }
     }
@@ -671,41 +968,49 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ? ("⬤  DaVinci Resolve active", .systemGreen)
                 : ("⬤  Waiting for Resolve…", .secondaryLabelColor)
         }()
-        item.attributedTitle = NSAttributedString(string: text, attributes: [
-            .foregroundColor: color,
-            .font: NSFont.systemFont(ofSize: 13)
-        ])
+        item.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [
+                .foregroundColor: color,
+                .font: NSFont.systemFont(ofSize: 13),
+            ])
     }
 
     func updateDiagnostics() {
         guard let item = diagnosticsMenuItem else { return }
         let seenApp = cachedFrontmostBundleId ?? "unknown"
-        let matching = resolveBundleIdOverride.isEmpty
+        let matching =
+            resolveBundleIdOverride.isEmpty
             ? "auto (com.blackmagic-design.DaVinciResolve*)"
             : resolveBundleIdOverride
         let lines = """
-        Frontmost app: \(seenApp)
-        Matching: \(matching)
-        Pinch events: \(magnifyEventsSeen) seen · \(magnifyEventsActedOn) used
-        Last magnitude: \(String(format: "%.4f", lastMagnifyMagnitude))
-        Last skip: \(lastSkipReason)
-        """
-        item.attributedTitle = NSAttributedString(string: lines, attributes: [
-            .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ])
+            Frontmost app: \(seenApp)
+            Matching: \(matching)
+            Pinch events: \(magnifyEventsSeen) seen · \(magnifyEventsActedOn) used
+            Last magnitude: \(String(format: "%.4f", lastMagnifyMagnitude))
+            Last skip: \(lastSkipReason)
+            """
+        item.attributedTitle = NSAttributedString(
+            string: lines,
+            attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: 10, weight: .regular),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ])
     }
 
     // MARK: - Actions
     @objc func sliderChanged(_ sender: NSSlider) {
         multiplier = sender.doubleValue
-        preferencesWindow?.contentView?.viewWithTag(2).flatMap { $0 as? NSTextField }?.stringValue = "\(Int(multiplier))"
+        preferencesWindow?.contentView?.viewWithTag(2).flatMap { $0 as? NSTextField }?.stringValue =
+            "\(Int(multiplier))"
     }
 
     @objc func resetToDefault(_ sender: Any) {
         multiplier = defaultMultiplier
-        preferencesWindow?.contentView?.viewWithTag(1).flatMap { $0 as? NSSlider }?.doubleValue = defaultMultiplier
-        preferencesWindow?.contentView?.viewWithTag(2).flatMap { $0 as? NSTextField }?.stringValue = "\(Int(defaultMultiplier))"
+        preferencesWindow?.contentView?.viewWithTag(1).flatMap { $0 as? NSSlider }?.doubleValue =
+            defaultMultiplier
+        preferencesWindow?.contentView?.viewWithTag(2).flatMap { $0 as? NSTextField }?.stringValue =
+            "\(Int(defaultMultiplier))"
     }
 
     @objc func invertChanged(_ sender: NSButton) {
@@ -733,7 +1038,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 "Label": "com.resolvezoom.app",
                 "ProgramArguments": [execPath],
                 "RunAtLoad": true,
-                "KeepAlive": false
+                "KeepAlive": false,
             ]
             try? FileManager.default.createDirectory(
                 at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
