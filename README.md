@@ -16,6 +16,7 @@ DaVinci Resolve doesn't support pinch-to-zoom on the timeline out of the box. Re
 - **Minimal footprint** — lives in the menu bar, uses no resources when Resolve isn't in focus
 - **Built-in diagnostics** — the menu shows which app is detected, how many gestures were handled, and why the last one was skipped
 - **Manual Resolve selection** — point the app at your Resolve install if auto-detection doesn't find it
+- **Fusion-aware pinch handling** — automatically passes pinch gestures through when Fusion is active, where Resolve provides native zoom
 
 If ResolveZoom saves you time, consider buying me a coffee — it helps keep the project going! [![Ko-fi](https://img.shields.io/badge/Buy%20me%20a%20coffee-ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/marcinkusnierz)
 
@@ -37,6 +38,7 @@ If ResolveZoom saves you time, consider buying me a coffee — it helps keep the
 3. Launch the app
 
 **First launch:** macOS will block the app because it's not signed with an Apple Developer certificate. To open it:
+
 - Right-click (or Control-click) `ResolveZoom.app` → **Open** → **Open**
 
 You only need to do this once. After that, the app opens normally.
@@ -50,14 +52,18 @@ You only need to do this once. After that, the app opens normally.
 Once running, ResolveZoom appears as an icon in the menu bar. Open DaVinci Resolve, place it in focus, and start pinching on your trackpad — the timeline will zoom in and out.
 
 **Menu bar status:**
+
 - 🟢 **DaVinci Resolve active** — gestures are being intercepted
 - ⚪ **Waiting for Resolve…** — Resolve is not in focus
 - 🔴 **No accessibility permission** — grant access in System Settings
 
 **Preferences** (click the menu bar icon → Preferences…):
+
 - **Zoom Sensitivity** — controls how fast the timeline zooms. Default is 800; increase for faster zoom, decrease for finer control
 - **Invert zoom direction** — reverses the zoom direction if it feels unnatural
 - **Launch at Login** — toggle autostart with macOS
+
+ResolveZoom checks Resolve's active page once per second while Resolve is focused. The Accessibility scan runs on a background utility queue with a 50 ms IPC timeout, so an unresponsive Resolve UI cannot interrupt pinch handling.
 
 ---
 
@@ -72,6 +78,7 @@ DaVinci Resolve has an option under **View → Zoom Around Mouse Pointer** that,
 **Why:** ResolveZoom works by intercepting trackpad pinch gestures and converting them into synthetic Alt+Scroll events that Resolve understands as zoom commands. Resolve's "Zoom Around Mouse Pointer" feature works correctly with native hardware scroll events, but our synthetic events take a different internal code path in Resolve that always defaults to playhead-centered zoom.
 
 Several approaches were investigated to work around this limitation:
+
 - Marking synthetic events as "continuous" (trackpad-style) using private CGEvent fields
 - Sending gesture phase information alongside the scroll event
 - Injecting synthetic magnify events (type 29) directly — Resolve ignores these entirely
