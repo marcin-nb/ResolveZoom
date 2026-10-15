@@ -2,6 +2,17 @@
 
 All notable changes to ResolveZoom are documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- **Zoom Around Mouse Pointer now works.** With View → Zoom Around Mouse Pointer enabled
+  in Resolve, pinches used to zoom towards the playhead anyway. Resolve only anchors on
+  the pointer when Option is held in the system keyboard state — the Option flag on the
+  scroll event alone is not enough. ResolveZoom now holds a synthetic Option key for the
+  duration of a pinch and releases it when the gesture ends, with a 150 ms timeout and
+  release on drag, app switch and quit as safety nets.
+
 ## [0.4] — 2026-08-08
 
 The headline of this release is a memory leak that made the app grow without bound

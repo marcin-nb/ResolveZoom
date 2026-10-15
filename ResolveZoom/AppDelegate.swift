@@ -130,6 +130,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// below 1.0 that were silently discarded and the gesture appeared to stall.
     var zoomAccumulator: Double = 0
 
+    /// Resolve only honours View → Zoom Around Mouse Pointer when Option is actually held in
+    /// the system keyboard state. A scroll event that merely carries the Option flag still
+    /// zooms, but anchored on the playhead — which is why marking events continuous, adding
+    /// phases or injecting magnify events never helped. So for the duration of a pinch we hold
+    /// a synthetic Option key, and release it the moment the gesture ends.
+    var syntheticOptionHeld = false
+    private let keyEventSource = CGEventSource(stateID: .hidSystemState)
+    private static let optionKeyCode: CGKeyCode = 58  // kVK_Option
+    /// Safety net for a gesture that never delivers its "ended" event. Pinch events arrive
+    /// every 8–16 ms, so 150 ms of silence means the fingers are gone.
+    private let optionReleaseDelay: DispatchTimeInterval = .milliseconds(150)
+    /// One timer, rescheduled on every event — creating a timer per event would put an
+    /// allocation back into the 60–120 Hz hot path.
+    private lazy var optionReleaseTimer: DispatchSourceTimer = {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .distantFuture)
+        timer.setEventHandler { [weak self] in self?.releaseSyntheticOption() }
+        timer.resume()
+        return timer
+    }()
+
     /// Cached frontmost bundle id. Calling `NSWorkspace.shared.frontmostApplication`
     /// inside the tap callback meant one lookup per event; it only changes when the
     /// active app changes, which we already observe.
@@ -313,6 +334,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Safely removes the event tap from the run loop and releases it.
     /// MUST be called before permissions are considered lost — prevents mouse click blocking.
     func disableEventTap() {
+        releaseSyntheticOption()
         stopFusionPolling()
         if let tap = tap {
             CGEvent.tapEnable(tap: tap, enable: false)
@@ -406,6 +428,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // MARK: - Synthetic Option key
+
+    /// Presses Option (if we haven't already) and pushes the release deadline out.
+    /// Posted before the scroll event it accompanies, so Resolve sees the modifier first.
+    func holdSyntheticOption() {
+        if !syntheticOptionHeld {
+            let flags = CGEventSource.flagsState(.hidSystemState)
+            // The user is physically holding Option — nothing to add, and we must not post
+            // a key-up for a key we never pressed.
+            guard !flags.contains(.maskAlternate) else { return }
+            guard
+                let down = CGEvent(
+                    keyboardEventSource: keyEventSource, virtualKey: Self.optionKeyCode,
+                    keyDown: true)
+            else { return }
+            down.flags = flags.union(.maskAlternate)
+            down.post(tap: .cghidEventTap)
+            syntheticOptionHeld = true
+        }
+        optionReleaseTimer.schedule(deadline: .now() + optionReleaseDelay)
+    }
+
+    /// Releases the synthetic Option. Safe to call at any time; a no-op unless we hold it.
+    /// A stuck Option would turn every click into an Option-click, so this is called on every
+    /// path that can end or abandon a gesture, not just the gesture's own "ended" event.
+    func releaseSyntheticOption() {
+        guard syntheticOptionHeld else { return }
+        syntheticOptionHeld = false
+        optionReleaseTimer.schedule(deadline: .distantFuture)
+        guard
+            let up = CGEvent(
+                keyboardEventSource: keyEventSource, virtualKey: Self.optionKeyCode, keyDown: false)
+        else { return }
+        up.flags = CGEventSource.flagsState(.hidSystemState).subtracting(.maskAlternate)
+        up.post(tap: .cghidEventTap)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        releaseSyntheticOption()
+    }
+
     // MARK: - Event Tap
     func setupEventTap() {
         disableEventTap()  // clean up any previous tap first
@@ -468,6 +531,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 delegate.magnifyEventsSeen += 1
 
+                // The last event of a pinch is a zoom gesture (subtype 8) in phase "ended"
+                // (4) or "cancelled" (8). Release the synthetic Option once it has been
+                // handled — `defer` runs after any scroll event below has been posted.
+                let gesturePhase = event.getIntegerValueField(CGEventField(rawValue: 132)!)
+                let isPinchEnd =
+                    event.getIntegerValueField(CGEventField(rawValue: 110)!) == 8
+                    && (gesturePhase == 4 || gesturePhase == 8)
+                defer { if isPinchEnd { delegate.releaseSyntheticOption() } }
+
                 // If horizontal scroll happened within last 100ms, this magnify is a mouse artifact
                 if CFAbsoluteTimeGetCurrent() - delegate.lastHorizontalScrollTime < 0.1 {
                     delegate.lastSkipReason = "horizontal scroll artifact"
@@ -477,6 +549,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard delegate.isResolveApp(delegate.cachedFrontmostBundleId) else {
                     delegate.lastSkipReason =
                         "not Resolve (\(delegate.cachedFrontmostBundleId ?? "unknown"))"
+                    delegate.releaseSyntheticOption()
                     return Unmanaged.passUnretained(event)
                 }
 
@@ -486,6 +559,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     delegate.lastSkipReason = "Fusion page (native pinch zoom)"
                     delegate.zoomAccumulator = 0
                     delegate.consecutiveMagnifyCount = 0
+                    delegate.releaseSyntheticOption()
                     return Unmanaged.passUnretained(event)
                 }
 
@@ -501,6 +575,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     // Drop any partial gesture state so the drag can't seed the next zoom.
                     delegate.zoomAccumulator = 0
                     delegate.consecutiveMagnifyCount = 0
+                    // A held synthetic Option would turn this drag into an Option-drag.
+                    delegate.releaseSyntheticOption()
                     return Unmanaged.passUnretained(event)
                 }
 
@@ -567,6 +643,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
                 scrollEvent.flags = .maskAlternate
                 scrollEvent.location = cgPoint
+                delegate.holdSyntheticOption()
                 scrollEvent.post(tap: .cghidEventTap)
                 delegate.magnifyEventsActedOn += 1
                 delegate.lastSkipReason = "—"
@@ -939,6 +1016,8 @@ guard let children = value as? [AXUIElement] else { return .unavailable }
     // MARK: - Status
     @objc func activeAppChanged() {
         DispatchQueue.main.async {
+            // Never carry a synthetic Option into whatever app just came forward.
+            self.releaseSyntheticOption()
             // Keep the cached bundle id in sync so the tap callback never has to ask.
             self.refreshFrontmostApp()
             self.scheduleFusionPagePoll()

@@ -17,6 +17,7 @@ DaVinci Resolve doesn't support pinch-to-zoom on the timeline out of the box. Re
 - **Built-in diagnostics** — the menu shows which app is detected, how many gestures were handled, and why the last one was skipped
 - **Manual Resolve selection** — point the app at your Resolve install if auto-detection doesn't find it
 - **Fusion-aware pinch handling** — automatically passes pinch gestures through when Fusion is active, where Resolve provides native zoom
+- **Zoom around the mouse pointer** — honours Resolve's View → Zoom Around Mouse Pointer setting
 
 If ResolveZoom saves you time, consider buying me a coffee — it helps keep the project going! [![Ko-fi](https://img.shields.io/badge/Buy%20me%20a%20coffee-ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/marcinkusnierz)
 
@@ -67,24 +68,19 @@ ResolveZoom checks Resolve's active page once per second while Resolve is focuse
 
 ---
 
+## Zoom Around Mouse Pointer
+
+DaVinci Resolve has an option under **View → Zoom Around Mouse Pointer** that makes the timeline zoom towards the cursor position instead of the playhead. ResolveZoom supports it: enable the option in Resolve and pinches zoom around the pointer. With the option off, they zoom towards the playhead as before.
+
+**How it works:** Resolve only anchors the zoom on the pointer when Option is actually held in the system keyboard state. A scroll event that merely carries the Option flag still zooms, but around the playhead — which is why marking the events continuous, adding gesture phases or injecting magnify events never helped. So for the duration of a pinch ResolveZoom holds a synthetic Option key, and releases it as soon as the gesture ends. As a safety net it is also released after 150 ms without pinch events, when a pinch event arrives while a mouse button is held, when another app comes forward, and when ResolveZoom quits. If you are already holding Option yourself, ResolveZoom leaves it alone.
+
+---
+
 ## Known Issues
 
-### "Zoom Around Mouse Pointer" is not supported
+### Option can stay held after a force-quit mid-pinch
 
-DaVinci Resolve has an option under **View → Zoom Around Mouse Pointer** that, when enabled, makes the timeline zoom towards the cursor position instead of the playhead.
-
-**ResolveZoom does not support this setting — the timeline will always zoom towards the playhead**, regardless of whether the option is enabled in Resolve.
-
-**Why:** ResolveZoom works by intercepting trackpad pinch gestures and converting them into synthetic Alt+Scroll events that Resolve understands as zoom commands. Resolve's "Zoom Around Mouse Pointer" feature works correctly with native hardware scroll events, but our synthetic events take a different internal code path in Resolve that always defaults to playhead-centered zoom.
-
-Several approaches were investigated to work around this limitation:
-
-- Marking synthetic events as "continuous" (trackpad-style) using private CGEvent fields
-- Sending gesture phase information alongside the scroll event
-- Injecting synthetic magnify events (type 29) directly — Resolve ignores these entirely
-- Querying the DaVinci Resolve scripting API — it does not expose timeline viewport zoom control
-
-This remains an open problem. Contributions and ideas are welcome.
+If ResolveZoom is force-quit or crashes while a pinch is in progress, it never gets to release its synthetic Option key, and clicks will act as Option-clicks. Press and release Option once to clear it.
 
 ---
 
